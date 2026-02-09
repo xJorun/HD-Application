@@ -1,3 +1,17 @@
+--[[
+	Projectile System
+	
+	Handles projectile spawning, physics, and hit detection on the client.
+	Uses a single manager to update all projectiles instead of giving each one
+	its own connection - way better for performance when you have lots of them.
+	
+	Hit detection uses both spatial queries and raycasts together because
+	fast projectiles can skip past thin walls between frames if you only check one.
+	
+	Note: damage is applied client-side here for testing. In a real game you'd
+	want to validate hits on the server so people can't cheat.
+]]
+
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -10,24 +24,26 @@ local Humanoid = Character:WaitForChild("Humanoid")
 local RootPart = Character:WaitForChild("HumanoidRootPart")
 local Camera = workspace.CurrentCamera
 
-local Animator = Humanoid:FindFirstChildOfClass("Animator") 
-local ThrowAnimation = ReplicatedStorage:FindFirstChild("Animation", true) and ReplicatedStorage.Animation:FindFirstChild("ThrowAnimation")
+local Animator = Humanoid:FindFirstChildOfClass("Animator")
+local ThrowAnimation = ReplicatedStorage:FindFirstChild("Animation", true) 
+	and ReplicatedStorage.Animation:FindFirstChild("ThrowAnimation")
 local ThrowTrack = ThrowAnimation and Animator:LoadAnimation(ThrowAnimation)
 
 if ThrowTrack then
 	ThrowTrack.Looped = false
 end
 
--- Projectile class using metatables
 local Projectile = {}
 Projectile.__index = Projectile
 
+-- keeps all projectiles in one place so we only need one heartbeat connection
 local ProjectileManager = {
 	Active = {},
 	NextId = 1,
 	UpdateConnection = nil
 }
 
+-- if a projectile config is missing a value, it pulls from here instead
 local DefaultConfig = {
 	Speed = 120,
 	Lifetime = 5,
@@ -42,10 +58,13 @@ local DefaultConfig = {
 	Color = Color3.fromRGB(255, 100, 50),
 }
 
-function Projectile.new(config, startPos, direction, owner)
+function Projectile.new(config: {[string]: any}?, startPos: Vector3, direction: Vector3, owner: Player)
 	local self = setmetatable({}, Projectile)
 	
+	-- metatable trick: missing keys in config will fall back to DefaultConfig
 	self.Config = setmetatable(config or {}, {__index = DefaultConfig})
+	
+	-- unique id lets the manager remove this specific projectile later
 	self.Id = ProjectileManager.NextId
 	ProjectileManager.NextId += 1
 	
@@ -55,7 +74,7 @@ function Projectile.new(config, startPos, direction, owner)
 	self.Owner = owner
 	self.StartPos = startPos
 	self.StartTime = tick()
-	self.HitTargets = {}
+	self.HitTargets = {} -- tracks who we've already hit so pierce doesn't double-damage
 	self.Active = true
 	
 	self:CreateVisual()
@@ -63,6 +82,7 @@ function Projectile.new(config, startPos, direction, owner)
 end
 
 function Projectile:CreateVisual()
+	-- no VFX path means invisible projectile, useful for hitscan stuff
 	if not self.Config.VFXPath then return end
 	
 	local vfx = ReplicatedStorage:FindFirstChild("VFX", true)
@@ -81,17 +101,16 @@ function Projectile:CreateVisual()
 	end
 end
 
-
--- Main physics update loop called every frame
-function Projectile:Update(dt)
+function Projectile:Update(dt: number): boolean
 	if not self.Active then return false end
 	
+	-- expired, clean it up
 	if tick() - self.StartTime > self.Config.Lifetime then
 		self:Destroy()
 		return false
 	end
 	
-	-- Apply gravity to velocity
+	-- gravity pulls velocity down over time, creating the arc
 	if self.Config.Gravity > 0 then
 		self.Velocity += Vector3.new(0, -self.Config.Gravity * dt, 0)
 		self.Direction = self.Velocity.Unit
@@ -101,21 +120,24 @@ function Projectile:Update(dt)
 		self:UpdateTracking(dt)
 	end
 	
+	-- save old position before moving, we need it for the raycast sweep later
 	local prevPos = self.Position
 	self.Position += self.Velocity * dt
 	
-	
 	if self.Part then
+		-- point the part in the direction we're moving
 		self.Part.CFrame = CFrame.new(self.Position, self.Position + self.Direction)
 	end
 	
 	if self:CheckCollision(prevPos) then
+		-- pierce projectiles keep going through targets, normal ones stop
 		if not self.Config.Pierce then
 			self:Destroy()
 			return false
 		end
 	end
 	
+	-- gone too far from where it started
 	if (self.Position - self.StartPos).Magnitude > self.Config.Range then
 		self:Destroy()
 		return false
@@ -124,9 +146,9 @@ function Projectile:Update(dt)
 	return true
 end
 
--- Homing behavior that curves toward nearest target
-function Projectile:UpdateTracking(dt)
-	local nearest = nil
+-- curves the projectile toward the nearest target
+function Projectile:UpdateTracking(dt: number)
+	local nearest: BasePart? = nil
 	local nearestDist = math.huge
 	
 	for _, model in workspace:GetChildren() do
@@ -146,18 +168,26 @@ function Projectile:UpdateTracking(dt)
 	
 	if nearest then
 		local toTarget = (nearest.Position - self.Position).Unit
+		-- blend current direction with target direction for a smooth curve
+		-- snapping directly would look unnatural
 		self.Direction = (self.Direction + toTarget * self.Config.TrackingStrength * dt * 20).Unit
 		self.Velocity = self.Direction * self.Config.Speed
 	end
 end
 
--- Uses OverlapParams and Raycasting for accurate hit detection
-function Projectile:CheckCollision(prevPos)
+-- uses two methods together: spatial query for overlap, raycast for fast movement
+-- either one alone would miss certain hits
+function Projectile:CheckCollision(prevPos: Vector3): boolean
 	local overlapParams = OverlapParams.new()
 	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
 	overlapParams.FilterDescendantsInstances = {Character, self.Part}
 	
-	local hitParts = workspace:GetPartBoundsInBox(CFrame.new(self.Position), self.Config.HitboxSize, overlapParams)
+	-- check if we're currently overlapping anything
+	local hitParts = workspace:GetPartBoundsInBox(
+		CFrame.new(self.Position), 
+		self.Config.HitboxSize, 
+		overlapParams
+	)
 	
 	for _, part in hitParts do
 		local model = part:FindFirstAncestorOfClass("Model")
@@ -171,6 +201,8 @@ function Projectile:CheckCollision(prevPos)
 		return true
 	end
 	
+	-- raycast from where we were to where we are now
+	-- catches anything we might have passed through at high speed
 	local rayParams = RaycastParams.new()
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 	rayParams.FilterDescendantsInstances = {Character, self.Part}
@@ -191,6 +223,7 @@ function Projectile:CheckCollision(prevPos)
 					return true
 				end
 			else
+				-- hit a wall or something, not a character
 				return true
 			end
 		end
@@ -199,14 +232,14 @@ function Projectile:CheckCollision(prevPos)
 	return false
 end
 
-function Projectile:OnHit(target)
+function Projectile:OnHit(target: Model)
 	self.HitTargets[target] = true
 	
 	local humanoid = target:FindFirstChildOfClass("Humanoid")
 	if humanoid then
 		humanoid:TakeDamage(self.Config.Damage)
 		
-		
+		-- respawn logic for testing, you'd handle this differently in production
 		if humanoid.Health <= 0 then
 			local originalPos = target:FindFirstChild("HumanoidRootPart")
 			local respawnPosition = originalPos and originalPos.Position or target:GetPivot().Position
@@ -227,6 +260,7 @@ function Projectile:Destroy()
 	self.Active = false
 	
 	if self.Part then
+		-- disable emitters first so particles fade out naturally instead of popping
 		for _, child in self.Part:GetDescendants() do
 			if child:IsA("ParticleEmitter") or child:IsA("Trail") or child:IsA("Beam") then
 				child.Enabled = false
@@ -236,15 +270,21 @@ function Projectile:Destroy()
 	end
 end
 
--- Spawns a new projectile and registers it with the manager
-function ProjectileManager.Fire(config, startPos, direction, owner)
+function ProjectileManager.Fire(
+	config: {[string]: any}?, 
+	startPos: Vector3, 
+	direction: Vector3, 
+	owner: Player?
+): number
 	local projectile = Projectile.new(config, startPos, direction, owner or Player)
 	ProjectileManager.Active[projectile.Id] = projectile
 	ProjectileManager.EnsureRunning()
 	return projectile.Id
 end
 
-function ProjectileManager.UpdateAll(dt)
+-- goes through every active projectile and updates it
+-- returns false means that projectile is done and gets removed
+function ProjectileManager.UpdateAll(dt: number)
 	for id, projectile in pairs(ProjectileManager.Active) do
 		if not projectile:Update(dt) then
 			ProjectileManager.Active[id] = nil
@@ -252,6 +292,7 @@ function ProjectileManager.UpdateAll(dt)
 	end
 end
 
+-- only starts the heartbeat when we actually have projectiles to update
 function ProjectileManager.EnsureRunning()
 	if ProjectileManager.UpdateConnection then return end
 	
@@ -271,10 +312,12 @@ local throwing = false
 local cooldown = false
 local trackingMode = false
 
--- Convert mouse position to world direction using ViewportPointToRay
+-- converts where you're pointing on screen into a 3d direction
 local function FireProjectile()
 	local mouse = UserInputService:GetMouseLocation()
 	local ray = Camera:ViewportPointToRay(mouse.X, mouse.Y)
+	
+	-- spawn it in front and above the player so it doesn't hit ourselves
 	local spawnPos = RootPart.Position + RootPart.CFrame.LookVector * 3 + Vector3.new(0, 2, 0)
 	
 	ProjectileManager.Fire({
@@ -289,7 +332,8 @@ local function FireProjectile()
 	throwing = false
 end
 
-
+-- animation has a marker called "Throw" at the release frame
+-- fires the projectile right when the throw happens visually
 if ThrowTrack then
 	ThrowTrack:GetMarkerReachedSignal("Throw"):Connect(FireProjectile)
 	ThrowTrack.Stopped:Connect(function()
@@ -297,10 +341,11 @@ if ThrowTrack then
 	end)
 end
 
-UserInputService.InputBegan:Connect(function(input, processed)
+UserInputService.InputBegan:Connect(function(input: InputObject, processed: boolean)
+	-- ignore if they're typing in chat or clicking ui
 	if processed then return end
 	
-	-- Toggle tracking mode
+	-- F toggles homing on/off
 	if input.KeyCode == Enum.KeyCode.F then
 		trackingMode = not trackingMode
 		print(trackingMode and "Tracking ON" or "Tracking OFF")
@@ -315,6 +360,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		if ThrowTrack then
 			throwing = true
 			ThrowTrack:Play()
+			-- backup in case the animation marker doesn't fire for some reason
 			task.delay(0.3, function()
 				if throwing then FireProjectile() end
 			end)
